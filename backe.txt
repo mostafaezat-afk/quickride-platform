@@ -1,0 +1,200 @@
+// Google Apps Script Code for Bashtil Platform Backend
+
+const SCRIPT_PROP = PropertiesService.getScriptProperties();
+
+function doGet(e) {
+  return handleRequest(e);
+}
+
+function doPost(e) {
+  return handleRequest(e);
+}
+
+function handleRequest(e) {
+  const lock = LockService.getScriptLock();
+  lock.tryLock(10000);
+
+  try {
+    const doc = SpreadsheetApp.getActiveSpreadsheet();
+    
+    // Helper to get or create sheet
+    const getSheet = (name) => {
+      let sheet = doc.getSheetByName(name);
+      if (!sheet) {
+        sheet = doc.insertSheet(name);
+        // Add headers if new
+        if (name === 'Complaints') {
+          sheet.appendRow(['id', 'title', 'type', 'desc', 'lat', 'lng', 'author', 'timestamp', 'status', 'image']);
+        } else if (name === 'Comments') {
+          sheet.appendRow(['id', 'complaintId', 'text', 'author', 'timestamp']);
+        } else if (name === 'Votes') {
+          sheet.appendRow(['complaintId', 'voterId', 'type']);
+        }
+      }
+      return sheet;
+    };
+
+    const action = e.parameter.action;
+
+    if (action === 'get_data') {
+      const complaintsSheet = getSheet('Complaints');
+      const commentsSheet = getSheet('Comments');
+      const votesSheet = getSheet('Votes');
+
+      const complaints = getData(complaintsSheet);
+      const comments = getData(commentsSheet);
+      const votes = getData(votesSheet);
+
+      // Nest data
+      const result = complaints.map(c => {
+        c.comments = comments.filter(com => com.complaintId == c.id);
+        c.votes = {
+            support: votes.filter(v => v.complaintId == c.id && v.type === 'support').length,
+            oppose: votes.filter(v => v.complaintId == c.id && v.type === 'oppose').length
+        };
+        // Check if user voted? - Client handles this via local storage for UI state locally, 
+        // but for accurate vote counts, we send totals.
+        return c;
+      });
+
+      return ContentService.createTextOutput(JSON.stringify({ status: 'success', data: result }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    else if (action === 'create_complaint') {
+      const sheet = getSheet('Complaints');
+      // POST body sent as JSON string in 'payload' param or raw postData
+      // Simple way: url params or post body
+      let data = e.parameter;
+      if (e.postData && e.postData.contents) {
+        try { data = JSON.parse(e.postData.contents); } catch(err){}
+      }
+      
+      const newRow = [
+        data.id, data.title, data.type, data.desc, data.lat, data.lng, 
+        data.author, data.timestamp, 'open', data.image || ''
+      ];
+      sheet.appendRow(newRow);
+      return successResponse();
+    }
+
+    else if (action === 'add_comment') {
+      const sheet = getSheet('Comments');
+      let data = e.parameter;
+      if (e.postData && e.postData.contents) {
+          try { data = JSON.parse(e.postData.contents); } catch(err){}
+      }
+      
+      sheet.appendRow([data.id, data.complaintId, data.text, data.author, data.timestamp]);
+      return successResponse();
+    }
+
+    else if (action === 'vote') {
+      const sheet = getSheet('Votes');
+      let data = e.parameter;
+      if (e.postData && e.postData.contents) {
+         try { data = JSON.parse(e.postData.contents); } catch(err){}
+      }
+
+      // Check if vote exists
+      const rows = sheet.getDataRange().getValues();
+      let rowIndex = -1;
+      for (let i = 1; i < rows.length; i++) {
+        if (rows[i][0] == data.complaintId && rows[i][1] == data.voterId) {
+          rowIndex = i + 1;
+          break;
+        }
+      }
+
+      if (rowIndex > -1) {
+        // Update or remove?
+        // If same type, maybe remove (toggle)? Client logic handles toggle by sending opposite or delete
+        // For simplicity: We just overwrite type.
+        sheet.getRange(rowIndex, 3).setValue(data.type);
+      } else {
+        sheet.appendRow([data.complaintId, data.voterId, data.type]);
+      }
+      return successResponse();
+    }
+    
+    else if (action === 'remove_vote') {
+        const sheet = getSheet('Votes');
+        let data = e.parameter;
+        if (e.postData && e.postData.contents) {
+             try { data = JSON.parse(e.postData.contents); } catch(err){}
+        }
+        
+        const rows = sheet.getDataRange().getValues();
+        for (let i = 1; i < rows.length; i++) {
+            if (rows[i][0] == data.complaintId && rows[i][1] == data.voterId) {
+                sheet.deleteRow(i + 1);
+                break;
+            }
+        }
+        return successResponse();
+    }
+    
+    else if (action === 'update_status') {
+         const sheet = getSheet('Complaints');
+         let data = e.parameter;
+         if (e.postData && e.postData.contents) {
+             try { data = JSON.parse(e.postData.contents); } catch(err){}
+         }
+         
+         const rows = sheet.getDataRange().getValues();
+         for (let i = 1; i < rows.length; i++) {
+             if (rows[i][0] == data.id) {
+                 sheet.getRange(i + 1, 9).setValue(data.status); // 9th column is Status
+                 break;
+             }
+         }
+         return successResponse();
+    }
+
+    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: 'Action not valid' }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (e) {
+    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: e.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getData(sheet) {
+  const rows = sheet.getDataRange().getValues();
+  const headers = rows[0];
+  const data = [];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const obj = {};
+    for (let j = 0; j < headers.length; j++) {
+      obj[headers[j]] = row[j];
+    }
+    data.push(obj);
+  }
+  return data;
+}
+
+function successResponse() {
+  return ContentService.createTextOutput(JSON.stringify({ status: 'success' }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// Setup function to run once manually
+function setup() {
+  const doc = SpreadsheetApp.getActiveSpreadsheet();
+  ['Complaints', 'Comments', 'Votes'].forEach(name => {
+      if (!doc.getSheetByName(name)) {
+          const sheet = doc.insertSheet(name);
+          if (name === 'Complaints') {
+              sheet.appendRow(['id', 'title', 'type', 'desc', 'lat', 'lng', 'author', 'timestamp', 'status', 'image']);
+          } else if (name === 'Comments') {
+              sheet.appendRow(['id', 'complaintId', 'text', 'author', 'timestamp']);
+          } else if (name === 'Votes') {
+              sheet.appendRow(['complaintId', 'voterId', 'type']);
+          }
+      }
+  });
+}
